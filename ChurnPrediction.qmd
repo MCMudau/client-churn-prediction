@@ -1,0 +1,192 @@
+---
+title: Customer Churn Predisction
+jupyter: python3
+---
+
+```{python}
+import pandas as pd
+
+
+```
+
+```{python}
+clients_data = pd.read_csv('telecom/Client.csv')
+records_data = pd.read_csv('telecom/Record.csv')
+
+# Merge on Customer_ID, then move Customer_ID to the front and churn to the end
+df = pd.merge(clients_data, records_data, on='Customer_ID')
+
+cols = ['Customer_ID'] + [c for c in df.columns if c not in ('Customer_ID', 'churn')] + ['churn']
+df = df[cols]
+
+df.head()
+```
+
+
+This study uses a classification model to predict the probability of a client to churn (stop using our sevices).
+
+Target Variable = churn
+
+# Data Analysis
+
+## class balance check
+
+
+```{python}
+import matplotlib.pyplot as plt
+
+# Counts and proportions of each class
+print(df['churn'].value_counts())
+print(df['churn'].value_counts(normalize=True))
+
+df['churn'].value_counts().plot(kind='bar')
+plt.title('Class Distribution: Churn')
+plt.xlabel('Churn')
+plt.ylabel('Count')
+plt.xticks([0, 1], ['Not Churned', 'Churned'], rotation=0)
+plt.show()
+```
+
+
+Since the classes are balanced (~50/50), accuracy is a meaningful baseline metric. However, we also report [precision/recall/AUC] because false negatives (missed churners) and false positives (unnecessary retention spend) have different business costs.
+
+## Cost of churn figure
+
+Question: how much revenue did we watch walk out the door, the revenue tied to customers that churned.
+
+Cost = count(churners) x (average revenue in churners)
+
+### features in action
+- churn (target) = churn
+- average monthly revenue (charge amount) = rev_Mean
+
+```{python}
+avg_revenue_per_churner = df.loc[df['churn'] == 1, 'rev_Mean'].mean()
+n_churners = (df['churn'] == 1).sum()
+
+
+cost_of_churn = n_churners * avg_revenue_per_churner  # monthly
+annual_cost_of_churn = cost_of_churn * 12  # if rev_Mean is monthly
+print("Monthly Cost of churn",cost_of_churn)
+print("Anuall Cost of churn ",annual_cost_of_churn)
+```
+
+
+Leading to a conclusion that churn prediction per client is a significant study.
+
+```{python}
+corr_with_churn = df.corr(numeric_only=True)['churn'].drop('churn')
+corr_with_churn = corr_with_churn.sort_values(key=abs, ascending=False)
+corr_with_churn
+```
+
+No single variable strongly predicts churn in isolation (max |correlation| ≈ 0.11), suggesting churn results from combinations of behaviors rather than one dominant factor, motivating a tree-based model that can capture these interactions.
+
+Tree-based models naturally capture interactions between variables through sequential splits, making them well-suited for churn, where no single variable is strongly predictive on its own.
+
+```{python}
+missing = df.isnull().sum()
+missing = missing[missing > 0].sort_values(ascending=False)
+missing
+```
+
+```{python}
+from sklearn.impute import SimpleImputer
+
+num_cols = df.select_dtypes(include='number').columns.drop('churn')
+cat_cols = df.select_dtypes(exclude='number').columns
+
+# Numeric: median imputation
+df[num_cols] = SimpleImputer(strategy='median').fit_transform(df[num_cols])
+
+# Categorical: fill with explicit "Unknown" category
+df[cat_cols] = df[cat_cols].fillna('Unknown')
+```
+
+```{python}
+missing = df.isnull().sum()
+missing = missing[missing > 0].sort_values(ascending=False)
+missing
+```
+
+High missingness (25-49%): numbcars, dwllsize, HHstatin, ownrent, dwlltype, lor, income, adults, infobase. These are largely third-party demographic/lifestyle attributes (household size, dwelling type, income bracket, etc.), likely unavailable because the data vendor could not match every customer to external records. Because absence may itself correlate with customer segment, these were retained and missing values recoded as an explicit "Unknown" category (for categoricals) rather than imputed, preserving any signal in the missingness itself.
+
+Moderate missingness (5-10%): hnd_webcap, prizm_social_one. Same treatment, filled with "Unknown".
+
+Low missingness (<3%): avg6mou, avg6rev, avg6qty, the kid* indicators, marital, rv, truck, forgntvl, ethnic, creditcd, change_mou, change_rev, hnd_price, vceovr_Mean. With such a small share of records affected, these were imputed simply: numeric columns with the median (robust to outliers/skew) and categorical columns with "Unknown" (or mode where the category is well-defined).
+
+```{python}
+customer_ids = df['Customer_ID']
+df = df.drop(columns='Customer_ID')
+```
+
+## One hot encoding
+
+One-hot encoding is necessary because trees (and most sklearn models) require numeric input and cannot directly process categorical values like "Married" or "Northeast." One-hot encoding converts each category into its own binary (0/1) column, indicating whether a row belongs to that category. This avoids implying a false numeric order between categories — for example, label-encoding marital as 1, 2, 3 would wrongly suggest one category is mathematically "greater" than another. The resulting binary columns also become clean yes/no split points for the decision tree (e.g., "is area_Northeast = 1?"), preserving all categorical information at the cost of additional columns.
+
+```{python}
+cat_cols = df.select_dtypes(exclude='number').columns
+data_encoded = pd.get_dummies(df, columns=cat_cols)
+data_encoded.head()
+```
+
+## Splitting the data into train and test sets
+
+Why this is essential: Splitting the data into training and test sets allows us to evaluate the model on data it has never seen, giving an honest estimate of how it will perform on new customers rather than just memorizing patterns in the data it was trained on (overfitting). Stratifying the split on churn ensures both the training and test sets preserve the same ~50/50 class balance as the full dataset, without this, a 30% random split could by chance produce a test set with a skewed churn ratio, making evaluation metrics like accuracy and recall unreliable or hard to compare across runs. Using a fixed random_state also makes the split reproducible, so results can be verified and compared consistently.
+
+```{python}
+from sklearn.model_selection import train_test_split
+
+X = data_encoded.drop(columns='churn')
+y = data_encoded['churn']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, stratify=y, random_state=42
+)
+```
+
+## Model Choice
+
+Random Forest: We use a random forest classifier as our model. Random forests build an ensemble of many decision trees, each trained on a random subset of the data and features, and combine their predictions by majority vote. Like individual decision trees, they split data based on threshold comparisons on individual features, making them invariant to monotonic feature transformations (e.g., scaling, normalization, or log transforms), a feature's relative ordering, not its absolute scale, is what matters for splits. This means we do not need to standardize or normalize our numeric features before fitting, unlike distance-based models (e.g., KNN) or gradient-based models (e.g., logistic regression, neural networks), which are sensitive to feature scale. Additionally, random forests naturally handle the mix of numeric and one-hot encoded categorical features in our dataset and can capture non-linear relationships and interactions between variables, directly addressing our earlier finding that no single feature is strongly correlated with churn on its own. By averaging across many trees, random forests also reduce the overfitting and high variance we observed with a single decision tree, leading to better generalization on unseen data.
+
+```{python}
+from sklearn.ensemble import RandomForestClassifier
+
+rf_model = RandomForestClassifier(random_state=42)
+rf_model.fit(X_train, y_train)
+```
+
+## The confusion matrix
+
+```{python}
+from sklearn.metrics import ConfusionMatrixDisplay
+
+y_pred = rf_model.predict(X_test)
+
+ConfusionMatrixDisplay.from_predictions(y_test, y_pred, display_labels=['Not Churned', 'Churned'])
+plt.title('Confusion Matrix')
+plt.show()
+```
+
+## Precision calculation
+
+```{python}
+from sklearn.metrics import accuracy_score
+
+rf_pred = rf_model.predict(X_test)
+accuracy = accuracy_score(y_test, rf_pred)
+print(f'Accuracy: {accuracy:.4f}')
+```
+
+**Why Accuracy is an Appropriate Metric Here:** Accuracy measures the proportion of all predictions (both churned and not churned) that the model gets correct. It can be misleading on imbalanced datasets, for example, if 95% of customers don't churn, a model that always predicts \"not churned\" would score 95% accuracy while being useless. However, our dataset is nearly balanced (~50% churn, ~50% not churned), so accuracy is not skewed by class frequency and provides a fair, intuitive measure of overall model performance. We still report it alongside AUC and the confusion matrix, since accuracy alone does not distinguish between the business costs of false positives (unnecessary retention offers) and false negatives (missed churners).
+
+```{python}
+from sklearn.metrics import RocCurveDisplay
+
+RocCurveDisplay.from_estimator(rf_model, X_test, y_test)
+plt.title('ROC Curve')
+plt.show()
+```
+
+The ROC curve plots the True Positive Rate (recall on churners) against the False Positive Rate (false alarms on non-churners) across all possible classification thresholds, and the AUC (Area Under the Curve) summarizes this into a single score of 0.66. Unlike accuracy, AUC is largely invariant to class imbalance, both the TPR and FPR are computed separately within each class (churners and non-churners), so the metric reflects the model's ability to rank a churner as riskier than a non-churner regardless of how many of each class exist in the data. An AUC of 0.66 means that if we pick a random churner and a random non-churner, the model assigns the churner a higher risk score about 66% of the time, meaningfully better than the 50% we'd expect from random guessing, though short of a highly precise classifier. For the business, this translates directly into actionable value: rather than contacting customers at random for retention offers, the company can rank all customers by predicted churn risk and focus outreach on the highest-risk segment, capturing a disproportionately large share of actual churners for a fraction of the contact volume, turning a previously untargeted retention budget into a focused, higher-return investment.
+
